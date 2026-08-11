@@ -9,10 +9,11 @@
     "web": "node server.js"
   },
   "dependencies": {
-    "node-telegram-bot-api": "^0.66.0",
+    "telegram": "^2.26.16",
     "express": "^4.19.2"
   },
   "comments": {
+    "telegram": "GramJS - MTProto client, used by bot.js for 2GB file support",
     "express": "only required by server.js (optional landing page / mini app), not by bot.js"
   }
 }

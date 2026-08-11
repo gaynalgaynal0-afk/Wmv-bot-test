@@ -1,5 +1,11 @@
-// bot.js — Node.js port of bot.py (WMV Converter Bot)
-// Termux edition: no keep-alive web server, no Render-only wiring.
+// bot.js — MTProto edition (GramJS) using a bot token.
+//
+// Why: the plain HTTP Bot API caps file downloads at 20MB and uploads at
+// ~50MB. GramJS talks MTProto directly (the same protocol Telegram Desktop
+// uses), so a bot logged in this way can send/receive files up to 2GB with
+// NO local server, NO compiling, and NO personal phone login — just your
+// bot token plus an api_id/api_hash pair from my.telegram.org.
+//
 // Run with: node bot.js
 // Requires: ffmpeg installed and on PATH (pkg install ffmpeg on Termux)
 
@@ -7,22 +13,27 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
-const TelegramBot = require("node-telegram-bot-api");
+const { TelegramClient, Api } = require("telegram");
+const { StringSession } = require("telegram/sessions");
+const { NewMessage } = require("telegram/events");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-// URL for the "time scale patcher" web app button. Only meaningful if you're
-// actually hosting server.js's mini app somewhere reachable over HTTPS
-// (Telegram requires a public HTTPS URL for web_app buttons — a bare Termux
-// device isn't reachable on its own, see README for tunnel options).
-// Leave unset to hide that keyboard row entirely.
+const API_ID = parseInt(process.env.TELEGRAM_API_ID || "0", 10);
+const API_HASH = process.env.TELEGRAM_API_HASH;
+// Only meaningful if you're also running server.js behind a public HTTPS
+// tunnel. Leave unset to hide that keyboard row entirely.
 const MINI_APP_URL = process.env.MINI_APP_URL || "";
-// If you're running the local telegram-bot-api server (see start.sh), point
-// this at it, e.g. "http://127.0.0.1:8081". Leave empty to use api.telegram.org
-// (standard Bot API limits apply: ~20MB download / 50MB upload).
-const LOCAL_API_URL = process.env.LOCAL_API_URL || "";
+const SESSION_FILE = path.join(__dirname, ".session");
 
 if (!BOT_TOKEN) {
   console.error("❌ BOT_TOKEN environment variable is required.");
+  process.exit(1);
+}
+if (!API_ID || !API_HASH) {
+  console.error(
+    "❌ TELEGRAM_API_ID and TELEGRAM_API_HASH are required for the MTProto edition.\n" +
+      "   Get them free from https://my.telegram.org (API Development Tools)."
+  );
   process.exit(1);
 }
 
@@ -32,35 +43,16 @@ const SUPPORTED_FORMATS = [
   "vob", "mpeg", "mpg",
 ];
 
-const CAPTION_MSG = ">__*Upload this video using JV 60FPS studio extension*__";
+const CAPTION_MSG = "Upload this video using JV 60FPS studio extension";
 
-// ── Bot setup ─────────────────────────────────────────────────────────────
-const botOptions = { polling: true };
-if (LOCAL_API_URL) {
-  botOptions.baseApiUrl = LOCAL_API_URL;
-  console.log(`Using local Bot API server at ${LOCAL_API_URL}`);
+// ── Session persistence (skip re-auth handshake on every restart) ─────────
+let savedSession = "";
+if (fs.existsSync(SESSION_FILE)) {
+  savedSession = fs.readFileSync(SESSION_FILE, "utf8").trim();
 }
-const bot = new TelegramBot(BOT_TOKEN, botOptions);
+const stringSession = new StringSession(savedSession);
 
-const menuKeyboard = [
-  [{ text: "🚀 Start the bot" }],
-  [{ text: "🎬 Convert video" }],
-];
-if (MINI_APP_URL) {
-  menuKeyboard.push([
-    { text: "🔧 time scale patcher", web_app: { url: MINI_APP_URL } },
-  ]);
-}
-const MAIN_MENU = {
-  reply_markup: { keyboard: menuKeyboard, resize_keyboard: true },
-};
-
-bot.setMyCommands([
-  { command: "start", description: "Start the bot" },
-  { command: "convert", description: "Convert a video to studio60fps" },
-]).catch((e) => console.error("setMyCommands failed:", e.message));
-
-// ── ffmpeg conversion helper ─────────────────────────────────────────────
+// ── ffmpeg conversion helper (unchanged) ───────────────────────────────────
 function convertToWmv(inputPath, outputPath) {
   return new Promise((resolve) => {
     const args = [
@@ -78,7 +70,7 @@ function convertToWmv(inputPath, outputPath) {
 
     proc.stderr.on("data", (d) => {
       stderr += d.toString();
-      if (stderr.length > 5000) stderr = stderr.slice(-5000); // cap memory
+      if (stderr.length > 5000) stderr = stderr.slice(-5000);
     });
     proc.on("error", (err) => {
       clearTimeout(timeout);
@@ -92,122 +84,162 @@ function convertToWmv(inputPath, outputPath) {
   });
 }
 
-// ── Handlers ──────────────────────────────────────────────────────────────
-bot.onText(/^\/start$/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    "🎬 *TIKTOK Studio method*\n\n" +
-      ">Send a video file to convert it to studio60fps\n" +
-      ">Tap *🎬 Convert video* or just send your file directly!\n\n" +
-      "*📦 Max size: 2GB*",
-    { parse_mode: "Markdown", ...MAIN_MENU }
-  );
-});
-
-bot.onText(/^(\/convert|🎬 Convert video)$/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    "📤 Send me your video file now!\nSupported: " + SUPPORTED_FORMATS.join(", "),
-    MAIN_MENU
-  );
-});
-
-bot.onText(/^🚀 Start the bot$/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    "✅ Bot is running!\n\nSend me any video file to convert it to studio60fps.",
-    MAIN_MENU
-  );
-});
-
-bot.on("message", async (msg) => {
-  const video = msg.video;
-  const document = msg.document;
-  if (!video && !document) return;
-
-  let fileId = null;
-  let originalName = "video";
-  let fileSize = 0;
-
-  if (video) {
-    fileId = video.file_id;
-    fileSize = video.file_size || 0;
-    originalName = `video_${video.file_unique_id}.mp4`;
-  } else if (document) {
-    const fname = document.file_name || "";
-    const ext = path.extname(fname).toLowerCase().replace(".", "");
-    const mime = document.mime_type || "";
-    if (mime.startsWith("video/") || SUPPORTED_FORMATS.includes(ext)) {
-      fileId = document.file_id;
-      fileSize = document.file_size || 0;
-      originalName = fname || "video";
-    }
+// ── Pull video-like document info straight off the raw MTProto message ────
+function extractVideoDoc(message) {
+  const media = message.media;
+  if (!media || media.className !== "MessageMediaDocument" || !media.document) {
+    return null;
   }
+  const doc = media.document;
+  if (doc.className !== "Document") return null;
 
-  if (!fileId) {
-    await bot.sendMessage(
-      msg.chat.id,
-      "Please send a video file.\nSupported: " + SUPPORTED_FORMATS.join(", ")
+  let filename = "";
+  let isVideo = false;
+  for (const attr of doc.attributes || []) {
+    if (attr.className === "DocumentAttributeFilename") filename = attr.fileName;
+    if (attr.className === "DocumentAttributeVideo") isVideo = true;
+  }
+  const mimeType = doc.mimeType || "";
+  const ext = filename.includes(".") ? filename.split(".").pop().toLowerCase() : "";
+
+  if (isVideo || mimeType.startsWith("video/") || SUPPORTED_FORMATS.includes(ext)) {
+    return {
+      doc,
+      filename: filename || `video_${doc.id}.mp4`,
+      sizeBytes: Number(doc.size),
+    };
+  }
+  return null;
+}
+
+function buildMenu(withMiniApp) {
+  const rows = [
+    new Api.KeyboardButtonRow({ buttons: [new Api.KeyboardButton({ text: "🚀 Start the bot" })] }),
+    new Api.KeyboardButtonRow({ buttons: [new Api.KeyboardButton({ text: "🎬 Convert video" })] }),
+  ];
+  if (withMiniApp) {
+    rows.push(
+      new Api.KeyboardButtonRow({
+        buttons: [new Api.KeyboardButtonSimpleWebView({ text: "🔧 time scale patcher", url: MINI_APP_URL })],
+      })
     );
-    return;
   }
+  return new Api.ReplyKeyboardMarkup({
+    rows,
+    resize: true,
+    singleUse: false,
+  });
+}
 
-  const sizeMb = fileSize / 1024 / 1024;
-  if (sizeMb > 2000) {
-    await bot.sendMessage(msg.chat.id, `❌ Too large (${sizeMb.toFixed(1)}MB). Max 2GB.`);
-    return;
-  }
+async function main() {
+  const client = new TelegramClient(stringSession, API_ID, API_HASH, {
+    connectionRetries: 5,
+  });
 
-  const status = await bot.sendMessage(msg.chat.id, "⬇️ Downloading...");
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "wmv_"));
+  await client.start({ botAuthToken: BOT_TOKEN });
+  fs.writeFileSync(SESSION_FILE, client.session.save());
+  console.log("✅ Bot starting (MTProto/GramJS edition, 2GB support)!");
 
-  try {
-    const ext = path.extname(originalName).replace(".", "") || "mp4";
-    const inputPath = path.join(tmpDir, `input.${ext}`);
-    const outputName = path.basename(originalName, path.extname(originalName)) + ".wmv";
-    const outputPath = path.join(tmpDir, outputName);
+  const MAIN_MENU = buildMenu(Boolean(MINI_APP_URL));
 
-    await bot.downloadFile(fileId, tmpDir).then((downloadedPath) => {
-      fs.renameSync(downloadedPath, inputPath);
-    });
+  client.addEventHandler(async (event) => {
+    const message = event.message;
+    if (!message) return;
+    const chatId = message.chatId;
+    const text = (message.message || "").trim();
 
-    await bot.editMessageText("🔄 Converting to studio60fps (near-lossless)...", {
-      chat_id: msg.chat.id,
-      message_id: status.message_id,
-    });
-
-    const [ok, err] = await convertToWmv(inputPath, outputPath);
-    if (!ok) {
-      await bot.editMessageText(`❌ Conversion failed:\n${err.slice(0, 200)}`, {
-        chat_id: msg.chat.id,
-        message_id: status.message_id,
+    // ── Commands / menu buttons ───────────────────────────────────────
+    if (text === "/start") {
+      await client.sendMessage(chatId, {
+        message:
+          "🎬 **TIKTOK Studio method**\n\n" +
+          ">Send a video file to convert it to studio60fps\n" +
+          ">Tap **🎬 Convert video** or just send your file directly!\n\n" +
+          "*📦 Max size: 2GB*",
+        parseMode: "md",
+        buttons: MAIN_MENU,
+      });
+      return;
+    }
+    if (text === "/convert" || text === "🎬 Convert video") {
+      await client.sendMessage(chatId, {
+        message: "📤 Send me your video file now!\nSupported: " + SUPPORTED_FORMATS.join(", "),
+        buttons: MAIN_MENU,
+      });
+      return;
+    }
+    if (text === "🚀 Start the bot") {
+      await client.sendMessage(chatId, {
+        message: "✅ Bot is running!\n\nSend me any video file to convert it to studio60fps.",
+        buttons: MAIN_MENU,
       });
       return;
     }
 
-    const outMb = fs.statSync(outputPath).size / 1024 / 1024;
-    await bot.editMessageText(`⬆️ Uploading (${outMb.toFixed(1)}MB)...`, {
-      chat_id: msg.chat.id,
-      message_id: status.message_id,
-    });
+    // ── Video / document handling ─────────────────────────────────────
+    const videoInfo = extractVideoDoc(message);
+    if (!message.media) return; // ignore plain text that isn't a command
+    if (!videoInfo) {
+      await client.sendMessage(chatId, {
+        message: "Please send a video file.\nSupported: " + SUPPORTED_FORMATS.join(", "),
+      });
+      return;
+    }
 
-    await bot.sendDocument(
-      msg.chat.id,
-      outputPath,
-      { caption: CAPTION_MSG, parse_mode: "Markdown" },
-      { filename: outputName }
-    );
-    await bot.deleteMessage(msg.chat.id, status.message_id);
-  } catch (e) {
-    await bot.editMessageText(`❌ Error: ${e.message}`, {
-      chat_id: msg.chat.id,
-      message_id: status.message_id,
-    }).catch(() => {});
-  } finally {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  }
+    const sizeMb = videoInfo.sizeBytes / 1024 / 1024;
+    if (sizeMb > 2000) {
+      await client.sendMessage(chatId, { message: `❌ Too large (${sizeMb.toFixed(1)}MB). Max 2GB.` });
+      return;
+    }
+
+    const status = await client.sendMessage(chatId, { message: "⬇️ Downloading..." });
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "wmv_"));
+
+    try {
+      const ext = path.extname(videoInfo.filename).replace(".", "") || "mp4";
+      const inputPath = path.join(tmpDir, `input.${ext}`);
+      const outputName = path.basename(videoInfo.filename, path.extname(videoInfo.filename)) + ".wmv";
+      const outputPath = path.join(tmpDir, outputName);
+
+      await client.downloadMedia(message, { outputFile: inputPath });
+
+      await client.editMessage(chatId, {
+        message: status.id,
+        text: "🔄 Converting to studio60fps (near-lossless)...",
+      });
+
+      const [ok, err] = await convertToWmv(inputPath, outputPath);
+      if (!ok) {
+        await client.editMessage(chatId, {
+          message: status.id,
+          text: `❌ Conversion failed:\n${err.slice(0, 200)}`,
+        });
+        return;
+      }
+
+      const outMb = fs.statSync(outputPath).size / 1024 / 1024;
+      await client.editMessage(chatId, {
+        message: status.id,
+        text: `⬆️ Uploading (${outMb.toFixed(1)}MB)...`,
+      });
+
+      await client.sendFile(chatId, {
+        file: outputPath,
+        caption: CAPTION_MSG,
+        forceDocument: true,
+      });
+      await client.deleteMessages(chatId, [status.id], { revoke: true });
+    } catch (e) {
+      await client
+        .editMessage(chatId, { message: status.id, text: `❌ Error: ${e.message}` })
+        .catch(() => {});
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }, new NewMessage({}));
+}
+
+main().catch((e) => {
+  console.error("Fatal error starting bot:", e);
+  process.exit(1);
 });
-
-bot.on("polling_error", (err) => console.error("Polling error:", err.message));
-
-console.log("Bot starting with Node.js edition!");
